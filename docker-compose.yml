@@ -1,0 +1,193 @@
+# -----------------------------------------------------------------------------
+# Architecture (see README.md for the full diagram/explanation):
+#
+#   Client -> Nginx -> Sample App -> (logs via Docker GELF) -> Logstash -> Elasticsearch -> Kibana
+#                                  -> (metrics via /metrics)  -> Prometheus -> Grafana
+#
+# All services share a single user-defined bridge network "devops-net" so
+# they can resolve each other by service name via Docker's embedded DNS.
+# NOTE: Docker's logging drivers (gelf) run in the Docker daemon's network
+# namespace, not inside the user-defined bridge, so app/nginx ship logs to
+# Logstash via the host-published UDP port (127.0.0.1:12201) rather than by
+# service name.
+# -----------------------------------------------------------------------------
+##### Created By Anurag and tested by Anurag Internally ############
+networks:
+  devops-net:
+    driver: bridge
+
+volumes:
+  es-data:
+  grafana-data:
+
+services:
+
+  app:
+    build: ./app
+    container_name: sample-app
+    restart: unless-stopped
+    networks:
+      - devops-net
+    ports:
+      - "5000:5000"   # exposed for direct debugging; normal access is via Nginx on :80
+    logging:
+      driver: gelf
+      options:
+        gelf-address: "udp://127.0.0.1:12201"
+        tag: "sample-app"
+    depends_on:
+      - logstash
+    mem_limit: 256m
+    cpus: 0.5
+    healthcheck:
+      # node:alpine's wget/busybox situation varies by patch version, so we
+      # use Node itself (always present) to hit /health from inside the container.
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:5000/health',(r)=>{process.exit(r.statusCode===200?0:1)}).on('error',()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: nginx
+    restart: unless-stopped
+    networks:
+      - devops-net
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    logging:
+      driver: gelf
+      options:
+        gelf-address: "udp://127.0.0.1:12201"
+        tag: "nginx"
+    depends_on:
+      - app
+    mem_limit: 64m
+    cpus: 0.25
+    healthcheck:
+      # nginx:alpine doesn't ship curl; use busybox's nc for a plain TCP check
+      # instead of relying on wget flag quirks across alpine versions.
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 80 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.4
+    container_name: elasticsearch
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    networks:
+      - devops-net
+    ports:
+      - "9200:9200"
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    mem_limit: 1g
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.13.4
+    container_name: logstash
+    restart: unless-stopped
+    networks:
+      - devops-net
+    ports:
+      - "12201:12201/udp"   # GELF input - receives app/nginx container logs
+      - "9600:9600"         # Logstash monitoring API (useful for troubleshooting)
+    volumes:
+      - ./logstash/pipeline:/usr/share/logstash/pipeline:ro
+      - ./logstash/logstash.yml:/usr/share/logstash/config/logstash.yml:ro
+    environment:
+      - "LS_JAVA_OPTS=-Xms256m -Xmx256m"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    mem_limit: 512m
+    healthcheck:
+      # The official Logstash image doesn't reliably ship curl/wget; use a
+      # bash TCP probe against the monitoring API port instead.
+      test: ["CMD-SHELL", "bash -c 'cat < /dev/null > /dev/tcp/127.0.0.1/9600' || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.13.4
+    container_name: kibana
+    restart: unless-stopped
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    networks:
+      - devops-net
+    ports:
+      - "5601:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:5601/api/status || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: prometheus
+    restart: unless-stopped
+    networks:
+      - devops-net
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - app
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9090/-/healthy || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  grafana:
+    image: grafana/grafana:10.4.2
+    container_name: grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    networks:
+      - devops-net
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

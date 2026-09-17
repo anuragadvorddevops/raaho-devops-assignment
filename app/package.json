@@ -1,0 +1,14 @@
+{
+  "name": "raaho-sample-app",
+  "version": "1.0.0",
+  "description": "Sample Node.js/Express app for the Raaho DevOps assignment (Nginx + ELK + Prometheus/Grafana demo)",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "pino": "^9.2.0",
+    "prom-client": "^15.1.3"
+  }
+}
